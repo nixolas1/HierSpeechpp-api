@@ -17,7 +17,10 @@ from speechsr48k.speechsr import SynthesizerTrn as AudioSR48
 from denoiser.generator import MPNet
 from denoiser.infer import denoise
 
-seed = 1111
+
+from cog import Path, Input, BasePredictor
+
+seed = 420691337
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
 np.random.seed(seed)
@@ -33,6 +36,7 @@ def load_checkpoint(filepath, device):
     checkpoint_dict = torch.load(filepath, map_location=device)
     print("Complete.")
     return checkpoint_dict
+
 def get_param_num(model):
     num_param = sum(param.numel() for param in model.parameters())
     return num_param
@@ -42,179 +46,141 @@ def intersperse(lst, item):
   return result
 
 def add_blank_token(text):
-
     text_norm = intersperse(text, 0)
     text_norm = torch.LongTensor(text_norm)
     return text_norm
 
-def tts(text, a, hierspeech):
+class Predictor(BasePredictor):
+    def setup(self):
+        self.output_dir = "output"
+        self.ckpt = "./logs/hierspeechpp_eng_kor/hierspeechpp_v1.1_ckpt.pth"
+        self.ckpt_text2w2v = "./logs/ttv_libritts_v1/ttv_lt960_ckpt.pth"
+        self.ckpt_sr = "./speechsr24k/G_340000.pth"
+        self.ckpt_sr48 = "./speechsr48k/G_100000.pth"
+        self.denoiser_ckpt = "denoiser/g_best"
+        self.scale_norm = "max"
+        self.output_sr = 16000
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.hps = utils.get_hparams_from_file(os.path.join(os.path.split(self.ckpt)[0], 'config.json'))
+        self.hps_t2w2v = utils.get_hparams_from_file(os.path.join(os.path.split(self.ckpt_text2w2v)[0], 'config.json'))
+        self.h_sr = utils.get_hparams_from_file(os.path.join(os.path.split(self.ckpt_sr)[0], 'config.json'))
+        self.h_sr48 = utils.get_hparams_from_file(os.path.join(os.path.split(self.ckpt_sr48)[0], 'config.json'))
+        self.hps_denoiser = utils.get_hparams_from_file(os.path.join(os.path.split(self.denoiser_ckpt)[0], 'config.json'))
+        self.model_load()
+
+    def model_load(self):
+        self.mel_fn = MelSpectrogramFixed(
+            sample_rate=self.hps.data.sampling_rate,
+            n_fft=self.hps.data.filter_length,
+            win_length=self.hps.data.win_length,
+            hop_length=self.hps.data.hop_length,
+            f_min=self.hps.data.mel_fmin,
+            f_max=self.hps.data.mel_fmax,
+            n_mels=self.hps.data.n_mel_channels,
+            window_fn=torch.hann_window
+        ).cuda()
     
-    net_g, text2w2v, audiosr, denoiser, mel_fn = hierspeech
+        self.net_g = SynthesizerTrn(self.hps.data.filter_length // 2 + 1,
+            self.hps.train.segment_size // self.hps.data.hop_length,
+            **self.hps.model).cuda()
+        self.net_g.load_state_dict(torch.load(self.ckpt))
+        self.net_g.eval()
 
-    os.makedirs(a.output_dir, exist_ok=True)
-    text = text_to_sequence(str(text), ["english_cleaners2"])
-    token = add_blank_token(text).unsqueeze(0).cuda()
-    token_length = torch.LongTensor([token.size(-1)]).cuda() 
+        self.text2w2v = Text2W2V(self.hps.data.filter_length // 2 + 1,
+        self.hps.train.segment_size // self.hps.data.hop_length,
+        **self.hps_t2w2v.model).cuda()
+        self.text2w2v.load_state_dict(torch.load(self.ckpt_text2w2v))
+        self.text2w2v.eval()
 
-    # Prompt load
-    audio, sample_rate = torchaudio.load(a.input_prompt)
+        if self.output_sr == 48000:
+            self.audiosr = AudioSR48(self.h_sr48.data.n_mel_channels,
+                self.h_sr48.train.segment_size // self.h_sr48.data.hop_length,
+                **self.h_sr48.model).cuda()
+            utils.load_checkpoint(self.ckpt_sr48, self.audiosr, None)
+            self.audiosr.eval()
 
-    # support only single channel
-    audio = audio[:1,:] 
-    # Resampling
-    if sample_rate != 16000:
-        audio = torchaudio.functional.resample(audio, sample_rate, 16000, resampling_method="kaiser_window") 
-    if a.scale_norm == 'prompt':
-        prompt_audio_max = torch.max(audio.abs())
+        elif self.output_sr == 24000:
+            self.audiosr = AudioSR(self.h_sr.data.n_mel_channels,
+            self.h_sr.train.segment_size // self.h_sr.data.hop_length,
+            **self.h_sr.model).cuda()
+            utils.load_checkpoint(self.ckpt_sr, self.audiosr, None)
+            self.audiosr.eval()
 
-    # We utilize a hop size of 320 but denoiser uses a hop size of 400 so we utilize a hop size of 1600
-    ori_prompt_len = audio.shape[-1]
-    p = (ori_prompt_len // 1600 + 1) * 1600 - ori_prompt_len
-    audio = torch.nn.functional.pad(audio, (0, p), mode='constant').data
+        else:
+            self.audiosr = None
 
-    file_name = os.path.splitext(os.path.basename(a.input_prompt))[0]
+        self.denoiser = MPNet(self.hps_denoiser).cuda()
+        state_dict = load_checkpoint(self.denoiser_ckpt, self.device)
+        self.denoiser.load_state_dict(state_dict['generator'])
+        self.denoiser.eval()
+        self.hierspeech = self.net_g, self.text2w2v, self.audiosr, self.denoiser, self.mel_fn
 
-    # If you have a memory issue during denosing the prompt, try to denoise the prompt with cpu before TTS 
-    # We will have a plan to replace a memory-efficient denoiser 
-    if a.denoise_ratio == 0:
-        audio = torch.cat([audio.cuda(), audio.cuda()], dim=0)
-    else:
+    def tts(self, text):
+        net_g, text2w2v, audiosr, denoiser, mel_fn = self.hierspeech
+        os.makedirs(self.output_dir, exist_ok=True)
+        text = text_to_sequence(str(text), ["english_cleaners2"])
+        token = add_blank_token(text).unsqueeze(0).cuda()
+        token_length = torch.LongTensor([token.size(-1)]).cuda()
+        audio, sample_rate = torchaudio.load(self.input_prompt)
+        audio = audio[:1,:]
+        if sample_rate != 16000:
+            audio = torchaudio.functional.resample(audio, sample_rate, 16000, resampling_method="kaiser_window")
+        if self.scale_norm == 'prompt':
+            prompt_audio_max = torch.max(audio.abs())
+        ori_prompt_len = audio.shape[-1]
+        p = (ori_prompt_len // 1600 + 1) * 1600 - ori_prompt_len
+        audio = torch.nn.functional.pad(audio, (0, p), mode='constant').data
+        if self.denoise_ratio == 0:
+            audio = torch.cat([audio.cuda(), audio.cuda()], dim=0)
+        else:
+            with torch.no_grad():
+                denoised_audio = denoise(audio.squeeze(0).cuda(), denoiser, self.hps_denoiser)
+            audio = torch.cat([audio.cuda(), denoised_audio[:,:audio.shape[-1]]], dim=0)
+        audio = audio[:,:ori_prompt_len]
+        src_mel = mel_fn(audio.cuda())
+        src_length = torch.LongTensor([src_mel.size(2)]).to(self.device)
+        src_length2 = torch.cat([src_length,src_length], dim=0)
         with torch.no_grad():
-            denoised_audio = denoise(audio.squeeze(0).cuda(), denoiser, hps_denoiser)
-        audio = torch.cat([audio.cuda(), denoised_audio[:,:audio.shape[-1]]], dim=0)
+            w2v_x, pitch = text2w2v.infer_noise_control(token, token_length, src_mel, src_length2,
+                                                         noise_scale=self.noise_scale_ttv, denoise_ratio=self.denoise_ratio)
+            src_length = torch.LongTensor([w2v_x.size(2)]).cuda()
+            pitch[pitch<torch.log(torch.tensor([55]).cuda())] = 0
+            converted_audio = net_g.voice_conversion_noise_control(w2v_x, src_length, src_mel, src_length2, pitch,
+                                                                   noise_scale=self.noise_scale_vc, denoise_ratio=self.denoise_ratio)
+            if self.output_sr == 48000 or 24000:
+                converted_audio = audiosr(converted_audio)
+        converted_audio = converted_audio.squeeze()
+        if self.scale_norm == 'prompt':
+            converted_audio = converted_audio / (torch.abs(converted_audio).max()) * 32767.0 * prompt_audio_max
+        else:
+            converted_audio = converted_audio / (torch.abs(converted_audio).max()) * 32767.0 * 0.999
+        converted_audio = converted_audio.cpu().numpy().astype('int16')
+        return converted_audio
 
-    
-    audio = audio[:,:ori_prompt_len]  # 20231108 We found that large size of padding decreases a performance so we remove the paddings after denosing.
 
-    src_mel = mel_fn(audio.cuda())
+    def predict(self, text: str = Input(description="Text to convert to speech"),
+                input_prompt: str = Input(description="URL to reference voice", default="http://localhost:5001/reference_voice.wav"),
+                noise_scale_ttv: float = Input(0.333, "Noise scale for Text-to-Vocal", ge=0, le=1),
+                noise_scale_vc: float = Input(0.333, "Noise scale for Voice Conversion", ge=0, le=1),
+                denoise_ratio: float = Input(0, "Denoising ratio (more than 0 needs lots of VMEM)", ge=0, le=1),
+                output_sample_rate: int = Input(
+                    description="Sample rate of the output audio file. More than 16k needs lots of VMEM.",
+                    choices=[16000, 24000, 48000], default=16000),
+                ) -> Path:
+        self.input_prompt = input_prompt
+        self.noise_scale_ttv = noise_scale_ttv
+        self.noise_scale_vc = noise_scale_vc
+        self.denoise_ratio = denoise_ratio
+        self.output_sr = output_sample_rate
 
-    src_length = torch.LongTensor([src_mel.size(2)]).to(device)
-    src_length2 = torch.cat([src_length,src_length], dim=0)
+        wavs = []
+        sentences = utils.split_and_recombine_text(text, 370, 420)
+        for sent in sentences:
+            print("--- " + sent)
+            wav = self.tts(text)
+            wavs.append(wav)
+        wav = np.concatenate(wavs)
 
-    ## TTV (Text --> W2V, F0)
-    with torch.no_grad():
-        w2v_x, pitch = text2w2v.infer_noise_control(token, token_length, src_mel, src_length2, noise_scale=a.noise_scale_ttv, denoise_ratio=a.denoise_ratio)
-   
-        src_length = torch.LongTensor([w2v_x.size(2)]).cuda()  
-        
-        ## Pitch Clipping
-        pitch[pitch<torch.log(torch.tensor([55]).cuda())]  = 0
-
-        ## Hierarchical Speech Synthesizer (W2V, F0 --> 16k Audio)
-        converted_audio = \
-            net_g.voice_conversion_noise_control(w2v_x, src_length, src_mel, src_length2, pitch, noise_scale=a.noise_scale_vc, denoise_ratio=a.denoise_ratio)
-                
-        ## SpeechSR (Optional) (16k Audio --> 24k or 48k Audio)
-        if a.output_sr == 48000 or 24000:
-            converted_audio = audiosr(converted_audio)
-
-    converted_audio = converted_audio.squeeze()
-    
-    if a.scale_norm == 'prompt':
-        converted_audio = converted_audio / (torch.abs(converted_audio).max()) * 32767.0 * prompt_audio_max
-    else:
-        converted_audio = converted_audio / (torch.abs(converted_audio).max()) * 32767.0 * 0.999 
-
-    converted_audio = converted_audio.cpu().numpy().astype('int16')
-
-    file_name2 = "{}.wav".format(file_name)
-    output_file = os.path.join(a.output_dir, file_name2)
-    
-    if a.output_sr == 48000:
-        write(output_file, 48000, converted_audio)
-    elif a.output_sr == 24000:
-        write(output_file, 24000, converted_audio)
-    else:
-        write(output_file, 16000, converted_audio)
-
-def model_load(a):
-    mel_fn = MelSpectrogramFixed(
-        sample_rate=hps.data.sampling_rate,
-        n_fft=hps.data.filter_length,
-        win_length=hps.data.win_length,
-        hop_length=hps.data.hop_length,
-        f_min=hps.data.mel_fmin,
-        f_max=hps.data.mel_fmax,
-        n_mels=hps.data.n_mel_channels,
-        window_fn=torch.hann_window
-    ).cuda()
-    
-    net_g = SynthesizerTrn(hps.data.filter_length // 2 + 1,
-        hps.train.segment_size // hps.data.hop_length,
-        **hps.model).cuda()
-    net_g.load_state_dict(torch.load(a.ckpt))
-    _ = net_g.eval()
-
-    text2w2v = Text2W2V(hps.data.filter_length // 2 + 1,
-    hps.train.segment_size // hps.data.hop_length,
-    **hps_t2w2v.model).cuda()
-    text2w2v.load_state_dict(torch.load(a.ckpt_text2w2v))
-    text2w2v.eval()
-
-    if a.output_sr == 48000:
-        audiosr = AudioSR48(h_sr48.data.n_mel_channels,
-            h_sr48.train.segment_size // h_sr48.data.hop_length,
-            **h_sr48.model).cuda()
-        utils.load_checkpoint(a.ckpt_sr48, audiosr, None)
-        audiosr.eval()
-       
-    elif a.output_sr == 24000:
-        audiosr = AudioSR(h_sr.data.n_mel_channels,
-        h_sr.train.segment_size // h_sr.data.hop_length,
-        **h_sr.model).cuda()
-        utils.load_checkpoint(a.ckpt_sr, audiosr, None)
-        audiosr.eval()
-      
-    else:
-        audiosr = None
-    
-    denoiser = MPNet(hps_denoiser).cuda()
-    state_dict = load_checkpoint(a.denoiser_ckpt, device)
-    denoiser.load_state_dict(state_dict['generator'])
-    denoiser.eval()
-    return net_g, text2w2v, audiosr, denoiser, mel_fn
-
-def inference(a):
-    
-    hierspeech = model_load(a) 
-    # Input Text 
-    text = load_text(a.input_txt)
-    # text = "hello I'm hierspeech"
-    
-    tts(text, a, hierspeech)
-
-def main():
-    print('Initializing Inference Process..')
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--input_prompt', default='example/reference_4.wav')
-    parser.add_argument('--input_txt', default='example/reference_4.txt')
-    parser.add_argument('--output_dir', default='output')
-    parser.add_argument('--ckpt', default='./logs/hierspeechpp_eng_kor/hierspeechpp_v2_ckpt.pth')
-    parser.add_argument('--ckpt_text2w2v', '-ct', help='text2w2v checkpoint path', default='./logs/ttv_libritts_v1/ttv_lt960_ckpt.pth')
-    parser.add_argument('--ckpt_sr', type=str, default='./speechsr24k/G_340000.pth')  
-    parser.add_argument('--ckpt_sr48', type=str, default='./speechsr48k/G_100000.pth')  
-    parser.add_argument('--denoiser_ckpt', type=str, default='denoiser/g_best')
-    parser.add_argument('--scale_norm', type=str, default='max')
-    parser.add_argument('--output_sr', type=float, default=48000)
-    parser.add_argument('--noise_scale_ttv', type=float,
-                        default=0.333)
-    parser.add_argument('--noise_scale_vc', type=float,
-                        default=0.333)
-    parser.add_argument('--denoise_ratio', type=float,
-                        default=0.8)
-    a = parser.parse_args()
-
-    global device, hps, hps_t2w2v,h_sr,h_sr48, hps_denoiser
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    hps = utils.get_hparams_from_file(os.path.join(os.path.split(a.ckpt)[0], 'config.json'))
-    hps_t2w2v = utils.get_hparams_from_file(os.path.join(os.path.split(a.ckpt_text2w2v)[0], 'config.json'))
-    h_sr = utils.get_hparams_from_file(os.path.join(os.path.split(a.ckpt_sr)[0], 'config.json') )
-    h_sr48 = utils.get_hparams_from_file(os.path.join(os.path.split(a.ckpt_sr48)[0], 'config.json') )
-    hps_denoiser = utils.get_hparams_from_file(os.path.join(os.path.split(a.denoiser_ckpt)[0], 'config.json'))
-
-    inference(a)
-
-if __name__ == '__main__':
-    main()
+        output_file = os.path.join("/tmp/", "out.wav")
+        write(output_file, self.output_sr, wav)
+        return Path(output_file)
